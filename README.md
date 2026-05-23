@@ -289,9 +289,26 @@ Both east and west GET traces only have 4 RGW spans and **no OSD-side spans** �
      └─ [rgw  ] get_obj_data       1112.3 ms                    893.5 ms
 ```
 
-Most of the GET latency is inside `get_obj_data`, which is the RADOS read + (for east) EC decode + body streaming back. Without OSD-side spans we can't subdivide the read further from the trace — Prometheus span metrics (`traces_spanmetrics_latency_bucket{service="osd",span_name="do_op"}` etc.) are the alternative if you need to attribute GET time to specific OSDs.
+Most of the GET latency is inside `get_obj_data`, which is the RADOS read + (for east) EC decode + body streaming back. Without OSD-side spans linked into the GET trace we can't subdivide the read further from the trace alone.
 
 [`traces/east-get_obj.json`, `traces/west-get_obj.json` — 4 spans, 2 KB each]
+
+#### OSD-side activity across the run windows (Prometheus span-metrics)
+
+Even though the GET-path OTLP trace context isn't propagated to OSDs, the OSDs still emit their own spans for every op they handle, and Tempo's metrics-generator turns those into Prometheus histograms. Aggregating over each zone's test window gives a clean view of how the OSDs *themselves* behaved during PUT-and-GET-mixed traffic:
+
+| OSD op | east p50 | east p99 | west p50 | west p99 |
+|---|---|---|---|---|
+| `do_op` | 1.30 ms | **13.1 ms** | 1.54 ms | **64.4 ms** |
+| `execute_ctx` | 1.28 ms | 12.6 ms | 1.53 ms | 64.3 ms |
+| `dequeue_op` | 1.11 ms | 17.3 ms | 1.30 ms | 59.0 ms |
+| `issue_repop` | 1.73 ms | 13.5 ms | 1.55 ms | 19.0 ms |
+
+**West's p99 is 3–5× worse on every primary OSD op.** Same reason as the client-side latency: every west PUT is funneled through just 2 of the 9 OSDs (the PG primary + secondary), so when those two are busy a new op queues behind them. East spreads each PUT across all 9 OSDs as EC shards, so any given OSD spends more time idle and services its share of an op quickly. The medians are close (because medians are dominated by the fast path on idle queues), but the tails diverge sharply once queues start backing up.
+
+This is exactly the kind of analysis you can't extract from the trace tree alone — even when the per-trace fan-out is hidden, the span-metric histograms still capture every op every OSD processed.
+
+The orphan-OSD trace search (`{resource.service.name="osd"}`) during each window returns mostly OSD-rooted traces with names like `op-request-created`, 3 spans each — that's a single OSD's view of one op (network arrival → enqueue → dequeue). Useful for spot-checking a slow OSD but not for end-to-end attribution. The PUT traces above (which *do* link RGW→OSD) remain the best illustration of the full fan-out shape.
 
 ### Span-rate fingerprint during the runs
 
