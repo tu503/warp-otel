@@ -32,7 +32,7 @@ EC 7+2 was expected to be slower; it wasn't. On this hardware (single host, 9 HD
 | chassis / board | Penguin Computing Relion 4724 (Supermicro X8DT6) |
 | CPU | 2 × Intel Xeon X5650 @ 2.67 GHz (Westmere-EP, 6c/12t each, 24 threads total) |
 | L3 cache | 24 MiB (2 instances) |
-| RAM | 188 GiB DDR3 |
+| RAM | **192 GiB** DDR3 (12 × 16 GiB, both sockets fully populated; kernel sees 188.88 GiB after BIOS/MMIO reservations) |
 | NICs | bond0 (`enp3s0` + `enp4s0`) → `br0`, primary 10.144.27.26 ; one WAN-mirror NIC and several link-down ports |
 | HBAs | onboard SAS + LSI/expander backplane |
 | OS | Gentoo 2.18, kernel `6.12.31-gentoo` |
