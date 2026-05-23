@@ -130,16 +130,161 @@ Storage efficiency: **east 7/9 ≈ 77.8%** vs **west 1/2 = 50%**. With a single-
 
 ## RGW Kubernetes deployment
 
-| | east | west |
+### Pattern: one Deployment + Service + ConfigMap + Secret per zone
+
+All RGW pods live in a single namespace `rgw-gateway` (formerly named `kubermon`), but **every zone gets its own complete set of resources** — Deployment, Service, ConfigMap, Secret — with no shared state between instances except for the underlying Ceph cluster. The zone name is the unit of isolation: it becomes the RADOS pool prefix (`<zone>.rgw.*`), the RGW realm/zonegroup/zone triple, the cephx client identity (`client.rgw.<zone>`), and the k8s resource suffix.
+
+```
+namespace: rgw-gateway
+├── Deployment/rgw-east   ──┐
+├── Service/rgw-east        │ instance "east":  pools east.rgw.*,
+├── ConfigMap/ceph-config-east   keyring client.rgw.east,
+└── Secret/ceph-rgw-keyring-east │ EC 7+2 data pool, LB IP .204
+│
+├── Deployment/rgw-west   ──┐
+├── Service/rgw-west        │ instance "west":  pools west.rgw.*,
+├── ConfigMap/ceph-config-west   keyring client.rgw.west,
+└── Secret/ceph-rgw-keyring-west │ replicated×2 data pool, LB IP .205
+```
+
+This is **not Rook**. The existing native Ceph cluster runs directly on the host (mon/mgr/mds/osd as systemd units on sm3); the RGW pods are *clients* of that cluster, configured purely via mounted `ceph.conf` + cephx keyring. The decoupling means RGW image rebuilds and pod restarts don't touch the data path.
+
+### Per-instance manifest set (east shown)
+
+**`ConfigMap/ceph-config-east`** — mounted at `/etc/ceph/ceph.conf`:
+
+```ini
+[global]
+fsid = f64f9c1f-c1d5-447b-ae97-dfa92dec9bde
+mon host = 10.144.27.26:6789
+auth cluster required = cephx
+auth service required = cephx
+auth client required = cephx
+jaeger_tracing_enable = true
+otel_tracing_endpoint = http://tempo.monitoring.svc:4318/v1/traces
+
+[client.rgw.east]
+rgw frontends = beast port=7480
+rgw zone = east
+rgw realm = east
+rgw zonegroup = east
+rgw enable usage log = true
+rgw usage log tick interval = 30
+rgw thread pool size = 64
+rgw enable gc threads = true
+log to stderr = true
+err to stderr = true
+log file = ""
+debug rgw = 1
+```
+
+**`Secret/ceph-rgw-keyring-east`** — mounted at `/etc/ceph/keyring`, `Opaque` type, single key:
+
+```yaml
+stringData:
+  keyring: |
+    [client.rgw.east]
+    key = <cephx-shared-secret>
+```
+
+The corresponding `ceph auth` entry has caps `osd 'allow rwx', mon 'allow rw', mgr 'allow rw'` — RGW needs `rwx` on OSDs to do data ops, `rw` on mon for map updates, and `rw` on mgr for usage stats.
+
+**`Deployment/rgw-east`** — 3 replicas:
+
+```yaml
+spec:
+  replicas: 3
+  selector: { matchLabels: { app: rgw, instance: east } }
+  template:
+    spec:
+      containers:
+        - name: radosgw
+          image: registry.alcg.io/radosgw:v75c6769f6c   # homelab fork build
+          command:
+            - /usr/bin/radosgw
+            - --id=rgw.east
+            - --name=client.rgw.east
+            - --cluster=ceph
+            - -c=/etc/ceph/ceph.conf
+            - --keyring=/etc/ceph/keyring
+            - --no-mon-config            # don't try to fetch config from mon cluster — use mounted ceph.conf only
+            - -f                          # foreground; let k8s manage lifecycle
+          ports: [{ name: http, containerPort: 7480 }]
+          readinessProbe: { httpGet: { path: /, port: 7480 }, initialDelaySeconds: 10, periodSeconds: 10 }
+          livenessProbe:  { httpGet: { path: /, port: 7480 }, initialDelaySeconds: 30, periodSeconds: 30 }
+          resources:
+            requests: { cpu: 250m, memory: 512Mi }
+            limits:   { cpu: "2",  memory: 2Gi }
+          volumeMounts:
+            - { name: ceph-config,  mountPath: /etc/ceph/ceph.conf, subPath: ceph.conf, readOnly: true }
+            - { name: ceph-keyring, mountPath: /etc/ceph/keyring,   subPath: keyring,   readOnly: true }
+      volumes:
+        - { name: ceph-config,  configMap: { name: ceph-config-east } }
+        - { name: ceph-keyring, secret:    { secretName: ceph-rgw-keyring-east } }
+```
+
+**`Service/rgw-east`** — `LoadBalancer`, MetalLB-allocated VIP from the `10.144.27.200-249` pool:
+
+```yaml
+spec:
+  type: LoadBalancer
+  selector: { app: rgw, instance: east }
+  ports:
+    - { name: http, port: 7480, targetPort: 7480, protocol: TCP }
+```
+
+Each instance gets its own external IP (east `.204`, west `.205`); clients pick which zone they're talking to by choosing an IP, not by HTTP virtual-hosting.
+
+### Pool layout per instance
+
+`setup-instance.sh` pre-creates the per-zone pools — pre-creation matters because RGW will auto-create them if missing but with default pg counts that may not match the workload:
+
+| pool name | pgs (created by script) | what RGW stores there |
 |---|---|---|
-| Deployment | `rgw-east` | `rgw-west` |
-| replicas | 3 | 3 |
-| image | `registry.alcg.io/radosgw` (homelab fork, built via buildah from host binaries — see `project_ceph_overlay`) | same |
-| Service | `rgw-east` LoadBalancer `10.144.27.204:7480` | `rgw-west` LoadBalancer `10.144.27.205:7480` |
-| node | all 6 pods land on sm3 | same |
-| ceph.conf | configmap `ceph-config-east` in ns `rgw-gateway` | configmap `ceph-config-west` |
-| frontend | `beast port=7480`, `rgw thread pool size = 64`, `debug rgw = 1` | same |
-| tracing | `jaeger_tracing_enable = true`, `otel_tracing_endpoint = http://tempo.monitoring.svc:4318/v1/traces` | same |
+| `<zone>.rgw.control` | 8 | distributed-lock/notification objects (small, mostly idle) |
+| `<zone>.rgw.meta` | 8 | user / bucket / period metadata |
+| `<zone>.rgw.log` | 8 | usage log, bilog, datalog |
+| `<zone>.rgw.buckets.index` | 16 | bucket index OMAP — STAT/LIST/DELETE hot path |
+| `<zone>.rgw.buckets.data` | 16 | actual object payload |
+
+These start as replicated-2× (the cluster default). Switching `<zone>.rgw.buckets.data` to an EC profile is a *post-create* step: `ceph osd pool create … erasure <profile>` + `radosgw-admin zone placement add` to point the default placement at the new pool. East's data pool was migrated this way (which is why it ended up as pool ID #64 with rule `east.rgw.buckets.data`, while everything else for east is in the original #44-#47 range).
+
+### Container image (homelab fork)
+
+`registry.alcg.io/radosgw:v75c6769f6c` is built **from scratch** by `build-image.sh` using buildah:
+
+1. Resolve `ldd /usr/bin/radosgw` against the host's installed Ceph (so the image inherits whatever the Portage overlay produced — including the OTLP-instrumented `ceph-999` branch).
+2. Copy `radosgw`, every transitive library (`/usr/lib64`, `/usr/lib64/ceph`, `/lib64/ld-linux-x86-64.so.2`) into a scratch container.
+3. Add minimal `/etc/{passwd,group,nsswitch.conf}` for the `ceph` user (UID 167).
+4. `EXPOSE 7480`, `ENTRYPOINT ["/usr/bin/radosgw"]`, `buildah commit`.
+
+Image size lands around 200-300 MiB — no shell, no package manager, no debug tooling. Updates: rebuild on the host, `buildah push` to a `docker-archive`, `ctr -n k8s.io images import` into containerd on each node, then `kubectl rollout restart deploy/rgw-*`. `deploy-image.sh` does all four steps as one command and waits for both rollouts to finish.
+
+This is also what makes the OTLP tracing patches land in production: any change to the `ceph-999` branch flows into a host rebuild (`emerge sys-cluster/ceph::homelab`) → new `/usr/bin/radosgw` → next `deploy-image.sh` picks it up.
+
+### Bootstrapping a new instance
+
+`setup-instance.sh <name>` is idempotent and does the full chain:
+
+1. `radosgw-admin realm create` → `zonegroup create --master --default` → `zone create --master --default`
+2. `radosgw-admin period update --commit`
+3. Pre-create the 5 pools above (control/meta/log/buckets.index/buckets.data)
+4. `ceph auth get-or-create client.rgw.<name> osd 'allow rwx' mon 'allow rw' mgr 'allow rw'`
+5. Write `<name>/11-ceph-keyring.yaml` (Secret) with the cephx key
+6. `radosgw-admin user create --uid=<name>-admin` (initial S3 admin user)
+7. Write `<name>/10-ceph-config.yaml` (ConfigMap), `<name>/20-deployment.yaml`, `<name>/30-service.yaml` if not present
+8. Print the S3 access/secret key pair
+
+So bringing up a third zone is:
+
+```bash
+./setup-instance.sh south
+kubectl apply -f south/
+# south.rgw.* pools created, rgw-south Deployment running,
+# external S3 endpoint at the next MetalLB pool IP.
+```
+
+### Live state at benchmark time
 
 ```
 $ kubectl -n rgw-gateway get pods,svc -o wide
@@ -150,9 +295,28 @@ pod/rgw-west-7df6fc45db-bmsmf   1/1 Running   sm3
 pod/rgw-west-7df6fc45db-gb2tr   1/1 Running   sm3
 pod/rgw-west-7df6fc45db-njk86   1/1 Running   sm3
 
-service/rgw-east   LoadBalancer 10.111.88.16 10.144.27.204 7480 app=rgw,instance=east
-service/rgw-west   LoadBalancer 10.104.10.75 10.144.27.205 7480 app=rgw,instance=west
+service/rgw-east   LoadBalancer  10.111.88.16  10.144.27.204  7480 → 32010/TCP
+service/rgw-west   LoadBalancer  10.104.10.75  10.144.27.205  7480 → 30089/TCP
 ```
+
+Both 3-replica Deployments scheduled all 6 pods onto `sm3` (no nodeAffinity — k8s scheduler just packs them there because it's where the cluster has slack). That matters for the benchmarks: the warp pod, the RGW pods, and the OSDs all share the same physical box, so network latency is `lo`-fast and the spindles are the only bottleneck.
+
+| | east | west |
+|---|---|---|
+| Deployment | `rgw-east` (revision 13) | `rgw-west` (revision 13) |
+| replicas | 3 (all on sm3) | 3 (all on sm3) |
+| image | `registry.alcg.io/radosgw:v75c6769f6c` (from host's ceph-999 build) | same |
+| Service | `rgw-east` LoadBalancer `10.144.27.204:7480` | `rgw-west` LoadBalancer `10.144.27.205:7480` |
+| ConfigMap | `ceph-config-east` | `ceph-config-west` |
+| Secret | `ceph-rgw-keyring-east` | `ceph-rgw-keyring-west` |
+| cephx client | `client.rgw.east` | `client.rgw.west` |
+| Realm / zonegroup / zone | `east` / `east` / `east` | `west` / `west` / `west` |
+| Data pool | `east.rgw.buckets.data` (pool #64, **EC 7+2**) | `west.rgw.buckets.data` (pool #58, **replicated×2**) |
+| Index pool | `east.rgw.buckets.index` (pg_num 32) | `west.rgw.buckets.index` (pg_num 16) |
+| Container resources | requests 250m/512Mi · limits 2c/2Gi | same |
+| ceph.conf knobs | `rgw thread pool size = 64`, `debug rgw = 1`, OTLP to `tempo.monitoring.svc:4318` | same |
+
+Source manifests + scripts live in a private GitLab repo (`gitlab.alcg.io/homelab/infra/rgw-gateway`); they're flux-managed but the cluster runs out of phase with Flux because the image-build path requires host-side buildah, not GitOps.
 
 ---
 
