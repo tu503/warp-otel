@@ -1,0 +1,58 @@
+All commands and output from this session will be recorded in container logs, including credentials and sensitive information passed through the command prompt.
+If you don't see a command prompt, try pressing enter.
+
+Report: DELETE. Concurrency: 16. Ran: 3m57s
+ * Average: 2.42 obj/s
+ * Reqs: Avg: 168.8ms, 50%: 165.2ms, 90%: 267.1ms, 99%: 335.1ms, Fastest: 32.3ms, Slowest: 652.4ms, StdDev: 66.8ms
+
+Throughput, split into 237 x 1s:
+ * Fastest: 8.82 obj/s
+ * 50% Median: 2.00 obj/s
+ * Slowest: 0.00 obj/s
+
+──────────────────────────────────
+
+Report: GET. Concurrency: 16. Ran: 3m58s
+ * Average: 109.34 MiB/s, 10.93 obj/s
+ * Reqs: Avg: 1177.4ms, 50%: 1202.9ms, 90%: 1373.9ms, 99%: 1481.2ms, Fastest: 363.9ms, Slowest: 1686.1ms, StdDev: 168.7ms
+ * TTFB: Avg: 92ms, Best: 19ms, 25th: 63ms, Median: 85ms, 75th: 114ms, 90th: 154ms, 99th: 261ms, Worst: 469ms StdDev: 44ms
+
+Throughput, split into 238 x 1s:
+ * Fastest: 118.3MiB/s, 11.83 obj/s
+ * 50% Median: 109.8MiB/s, 10.98 obj/s
+ * Slowest: 95.5MiB/s, 9.55 obj/s
+
+──────────────────────────────────
+
+Report: PUT. Concurrency: 16. Ran: 3m57s
+ * Average: 36.86 MiB/s, 3.69 obj/s
+ * Reqs: Avg: 687.2ms, 50%: 665.2ms, 90%: 943.9ms, 99%: 1109.2ms, Fastest: 267.6ms, Slowest: 2153.6ms, StdDev: 172.8ms
+
+Throughput, split into 237 x 1s:
+ * Fastest: 89.1MiB/s, 8.91 obj/s
+ * 50% Median: 34.2MiB/s, 3.42 obj/s
+ * Slowest: 0.00 obj/s
+
+──────────────────────────────────
+
+Report: STAT. Concurrency: 16. Ran: 3m57s
+ * Average: 7.30 obj/s
+ * Reqs: Avg: 18.7ms, 50%: 13.6ms, 90%: 40.0ms, 99%: 92.9ms, Fastest: 2.8ms, Slowest: 231.4ms, StdDev: 16.5ms
+
+Throughput, split into 237 x 1s:
+ * Fastest: 18.00 obj/s
+ * 50% Median: 7.00 obj/s
+ * Slowest: 0.00 obj/s
+
+
+──────────────────────────────────
+
+Report: Total. Concurrency: 16. Ran: 3m58s
+ * Average: 146.37 MiB/s, 24.35 obj/s
+
+Throughput, split into 238 x 1s:
+ * Fastest: 167.4MiB/s, 41.40 obj/s
+ * 50% Median: 153.3MiB/s, 24.13 obj/s
+ * Slowest: 126.4MiB/s, 14.64 obj/s
+
+pod "warp-east-full" deleted from rgw-gateway namespace

@@ -1,0 +1,58 @@
+All commands and output from this session will be recorded in container logs, including credentials and sensitive information passed through the command prompt.
+If you don't see a command prompt, try pressing enter.
+
+Report: DELETE. Concurrency: 16. Ran: 3m57s
+ * Average: 2.43 obj/s
+ * Reqs: Avg: 315.3ms, 50%: 312.4ms, 90%: 551.5ms, 99%: 646.2ms, Fastest: 13.7ms, Slowest: 1141.0ms, StdDev: 145.5ms
+
+Throughput, split into 237 x 1s:
+ * Fastest: 6.74 obj/s
+ * 50% Median: 2.41 obj/s
+ * Slowest: 0.00 obj/s
+
+──────────────────────────────────
+
+Report: GET. Concurrency: 16. Ran: 3m57s
+ * Average: 109.82 MiB/s, 10.98 obj/s
+ * Reqs: Avg: 1092.5ms, 50%: 1128.3ms, 90%: 1292.0ms, 99%: 1450.1ms, Fastest: 392.5ms, Slowest: 1650.2ms, StdDev: 177.8ms
+ * TTFB: Avg: 108ms, Best: 9ms, 25th: 69ms, Median: 95ms, 75th: 130ms, 90th: 182ms, 99th: 332ms, Worst: 590ms StdDev: 55ms
+
+Throughput, split into 237 x 1s:
+ * Fastest: 117.7MiB/s, 11.77 obj/s
+ * 50% Median: 110.1MiB/s, 11.01 obj/s
+ * Slowest: 92.0MiB/s, 9.20 obj/s
+
+──────────────────────────────────
+
+Report: PUT. Concurrency: 16. Ran: 3m57s
+ * Average: 36.28 MiB/s, 3.63 obj/s
+ * Reqs: Avg: 771.3ms, 50%: 765.9ms, 90%: 1069.5ms, 99%: 1275.0ms, Fastest: 257.6ms, Slowest: 2087.7ms, StdDev: 205.4ms
+
+Throughput, split into 237 x 1s:
+ * Fastest: 87.9MiB/s, 8.79 obj/s
+ * 50% Median: 33.1MiB/s, 3.31 obj/s
+ * Slowest: 3.6MiB/s, 0.36 obj/s
+
+──────────────────────────────────
+
+Report: STAT. Concurrency: 16. Ran: 3m57s
+ * Average: 7.32 obj/s
+ * Reqs: Avg: 42.4ms, 50%: 28.4ms, 90%: 103.3ms, 99%: 230.4ms, Fastest: 2.5ms, Slowest: 390.3ms, StdDev: 45.2ms
+
+Throughput, split into 237 x 1s:
+ * Fastest: 20.17 obj/s
+ * 50% Median: 7.00 obj/s
+ * Slowest: 0.00 obj/s
+
+
+──────────────────────────────────
+
+Report: Total. Concurrency: 16. Ran: 3m57s
+ * Average: 146.10 MiB/s, 24.36 obj/s
+
+Throughput, split into 237 x 1s:
+ * Fastest: 134.3MiB/s, 39.68 obj/s
+ * 50% Median: 159.6MiB/s, 24.12 obj/s
+ * Slowest: 132.6MiB/s, 14.29 obj/s
+
+pod "warp-west-full" deleted from rgw-gateway namespace
