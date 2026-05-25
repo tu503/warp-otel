@@ -1,58 +1,55 @@
-All commands and output from this session will be recorded in container logs, including credentials and sensitive information passed through the command prompt.
-If you don't see a command prompt, try pressing enter.
 
-Report: DELETE. Concurrency: 16. Ran: 3m57s
- * Average: 2.43 obj/s
- * Reqs: Avg: 315.3ms, 50%: 312.4ms, 90%: 551.5ms, 99%: 646.2ms, Fastest: 13.7ms, Slowest: 1141.0ms, StdDev: 145.5ms
+Report: DELETE. Concurrency: 16. Ran: 3m56s
+ * Average: 2.72 obj/s
+ * Reqs: Avg: 205.5ms, 50%: 80.3ms, 90%: 752.1ms, 99%: 1556.4ms, Fastest: 5.7ms, Slowest: 3026.9ms, StdDev: 368.7ms
 
-Throughput, split into 237 x 1s:
- * Fastest: 6.74 obj/s
- * 50% Median: 2.41 obj/s
+Throughput, split into 236 x 1s:
+ * Fastest: 8.40 obj/s
+ * 50% Median: 2.37 obj/s
  * Slowest: 0.00 obj/s
 
 ──────────────────────────────────
 
-Report: GET. Concurrency: 16. Ran: 3m57s
- * Average: 109.82 MiB/s, 10.98 obj/s
- * Reqs: Avg: 1092.5ms, 50%: 1128.3ms, 90%: 1292.0ms, 99%: 1450.1ms, Fastest: 392.5ms, Slowest: 1650.2ms, StdDev: 177.8ms
- * TTFB: Avg: 108ms, Best: 9ms, 25th: 69ms, Median: 95ms, 75th: 130ms, 90th: 182ms, 99th: 332ms, Worst: 590ms StdDev: 55ms
+Report: GET. Concurrency: 16. Ran: 3m59s
+ * Average: 121.67 MiB/s, 12.17 obj/s
+ * Reqs: Avg: 1002.1ms, 50%: 352.9ms, 90%: 3312.1ms, 99%: 4560.3ms, Fastest: 22.3ms, Slowest: 5649.0ms, StdDev: 1233.8ms
+ * TTFB: Avg: 231ms, Best: 4ms, 25th: 85ms, Median: 131ms, 75th: 234ms, 90th: 624ms, 99th: 1.433s, Worst: 2.508s StdDev: 268ms
 
-Throughput, split into 237 x 1s:
- * Fastest: 117.7MiB/s, 11.77 obj/s
- * 50% Median: 110.1MiB/s, 11.01 obj/s
- * Slowest: 92.0MiB/s, 9.20 obj/s
+Throughput, split into 239 x 1s:
+ * Fastest: 167.1MiB/s, 16.71 obj/s
+ * 50% Median: 120.6MiB/s, 12.06 obj/s
+ * Slowest: 72.1MiB/s, 7.21 obj/s
 
 ──────────────────────────────────
 
-Report: PUT. Concurrency: 16. Ran: 3m57s
- * Average: 36.28 MiB/s, 3.63 obj/s
- * Reqs: Avg: 771.3ms, 50%: 765.9ms, 90%: 1069.5ms, 99%: 1275.0ms, Fastest: 257.6ms, Slowest: 2087.7ms, StdDev: 205.4ms
+Report: PUT. Concurrency: 16. Ran: 3m58s
+ * Average: 40.62 MiB/s, 4.06 obj/s
+ * Reqs: Avg: 844.0ms, 50%: 422.6ms, 90%: 2699.4ms, 99%: 3687.5ms, Fastest: 145.3ms, Slowest: 4875.0ms, StdDev: 969.4ms
 
-Throughput, split into 237 x 1s:
- * Fastest: 87.9MiB/s, 8.79 obj/s
- * 50% Median: 33.1MiB/s, 3.31 obj/s
- * Slowest: 3.6MiB/s, 0.36 obj/s
+Throughput, split into 238 x 1s:
+ * Fastest: 95.4MiB/s, 9.54 obj/s
+ * 50% Median: 40.4MiB/s, 4.04 obj/s
+ * Slowest: 2.1MiB/s, 0.21 obj/s
 
 ──────────────────────────────────
 
 Report: STAT. Concurrency: 16. Ran: 3m57s
- * Average: 7.32 obj/s
- * Reqs: Avg: 42.4ms, 50%: 28.4ms, 90%: 103.3ms, 99%: 230.4ms, Fastest: 2.5ms, Slowest: 390.3ms, StdDev: 45.2ms
+ * Average: 8.11 obj/s
+ * Reqs: Avg: 57.6ms, 50%: 6.3ms, 90%: 186.5ms, 99%: 803.9ms, Fastest: 1.1ms, Slowest: 1769.4ms, StdDev: 141.8ms
 
 Throughput, split into 237 x 1s:
- * Fastest: 20.17 obj/s
- * 50% Median: 7.00 obj/s
+ * Fastest: 18.38 obj/s
+ * 50% Median: 8.00 obj/s
  * Slowest: 0.00 obj/s
 
 
 ──────────────────────────────────
 
-Report: Total. Concurrency: 16. Ran: 3m57s
- * Average: 146.10 MiB/s, 24.36 obj/s
+Report: Total. Concurrency: 16. Ran: 3m59s
+ * Average: 162.35 MiB/s, 27.03 obj/s
 
-Throughput, split into 237 x 1s:
- * Fastest: 134.3MiB/s, 39.68 obj/s
- * 50% Median: 159.6MiB/s, 24.12 obj/s
- * Slowest: 132.6MiB/s, 14.29 obj/s
+Throughput, split into 239 x 1s:
+ * Fastest: 168.6MiB/s, 40.24 obj/s
+ * 50% Median: 158.1MiB/s, 26.81 obj/s
+ * Slowest: 159.8MiB/s, 16.86 obj/s
 
-pod "warp-west-full" deleted from rgw-gateway namespace

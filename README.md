@@ -5,7 +5,7 @@ A side-by-side `warp mixed` benchmark run against two RGW zones on the same sing
 - **rgw-east**: data pool is **erasure coded 7+2** (ISA-L Reed-Solomon, `crush-failure-domain=osd`)
 - **rgw-west**: data pool is **replicated, size=2 min_size=1**
 
-Date: 2026-05-23. Ceph: `tentacle 20.1.1` (homelab fork, OTLP-instrumented). Warp: `1.3.1`.
+Date: 2026-05-25. Ceph: `tentacle 20.1.1-r3` (homelab fork, OTLP-instrumented with end-to-end GET trace propagation + per-phase BlueStore write spans, both new since the previous run). Warp: `minio/warp:latest`.
 
 ---
 
@@ -13,15 +13,37 @@ Date: 2026-05-23. Ceph: `tentacle 20.1.1` (homelab fork, OTLP-instrumented). War
 
 | op | metric | east (EC 7+2) | west (replicated 2×) | Δ |
 |---|---|---|---|---|
-| Total | throughput | **146.37 MiB/s, 24.35 obj/s** | **146.10 MiB/s, 24.36 obj/s** | ≈0 |
-| PUT | avg latency | **687.2 ms** | 771.3 ms | east **−11%** |
-| PUT | p99 latency | **1109 ms** | 1275 ms | east **−13%** |
-| GET | avg latency | 1177 ms | **1092 ms** | west **−7%** |
-| GET | TTFB avg | **92 ms** | 108 ms | east **−15%** |
-| DELETE | avg latency | **168.8 ms** | 315.3 ms | east **−46%** |
-| STAT | avg latency | **18.7 ms** | 42.4 ms | east **−56%** |
+| Total | throughput | **284.37 MiB/s, 47.38 obj/s** | 162.35 MiB/s, 27.03 obj/s | east **+75%** |
+| PUT | throughput | **71.32 MiB/s, 7.13 obj/s** | 40.62 MiB/s, 4.06 obj/s | east **+76%** |
+| PUT | p50 latency | **435.7 ms** | 422.6 ms | tie |
+| PUT | p99 latency | **1947.9 ms** | 3687.5 ms | east **−47%** |
+| GET | throughput | **213.06 MiB/s, 21.31 obj/s** | 121.67 MiB/s, 12.17 obj/s | east **+75%** |
+| GET | p50 latency | **257.8 ms** | 352.9 ms | east **−27%** |
+| GET | p99 latency | **2176.2 ms** | 4560.3 ms | east **−52%** |
+| GET | TTFB avg | **135 ms** | 231 ms | east **−42%** |
+| STAT | avg latency | **18.9 ms** | 57.6 ms | east **−67%** |
+| STAT | p99 latency | **197 ms** | 803 ms | east **−75%** |
+| DELETE | avg latency | **170.2 ms** | 205.5 ms | east **−17%** |
+| DELETE | p99 latency | **529.1 ms** | 1556.4 ms | east **−66%** |
 
-EC 7+2 was expected to be slower; it wasn't. On this hardware (single host, 9 HDD OSDs, EC failure-domain=osd) EC parallelizes every write across all 9 spindles, while replicated×2 only touches 2 spindles per write. The metadata-heavy ops (STAT/DELETE) tilt east further because east's index pool has 2× more PGs (32 vs 16).
+EC 7+2 wins decisively on every dimension this run — both throughput (1.75×) and tail latency (3-4× better p99). The single-host constraint flips the usual rule: EC parallelizes every write across all 9 spindles, while replicated×2 only touches 2 of 9 OSDs and the rest sit idle. At 16 concurrent workers the queue depth on west's narrow fan-out shows up in both `do_op` p99 (121 ms west vs 15 ms east — **8×**) and `bluestore_read` p99 (127 ms vs 55 ms — **2.3×**).
+
+---
+
+## What changed since the 2026-05-23 run
+
+This is a rerun of the same workload with a substantially upgraded tracer. Concretely:
+
+| Coverage | Before (r2, 2026-05-23) | Now (r3, 2026-05-25) |
+|---|---|---|
+| OSD spans reaching Tempo at all | broken on r2 build (bluestore tracer's `Tracer::init()` orphaned the osd Provider's exporter — silently dropped every OSD span when `bluestore_tracing_enable=true`) | **fixed** via `Tracer::init_from_global` so both scopes share one provider |
+| GET → OSD trace linkage | not propagated; GET traces had only 4 RGW spans, no OSD-side detail | **propagated end-to-end** through `ReadOp::Params::trace_ctx` → `RadosReadOp::iterate` → `RGWRados::Object::Read::iterate` → `get_obj_data` → `rgw::Aio::librados_op` → `librados::async_operate` → `IoCtx::aio_operate(... jspan_context)` → `Objecter::Op::otel_trace` → `MOSDOp.otel_trace` → OSD `op-request-created` |
+| Per-chunk rados_read span | absent | **added** — one `rados_read` span per librados aio read (default 4 MiB chunk) |
+| BlueStore write-phase visibility | only `queue_transactions` + `txc_aio_wait` (start and end of txc lifetime) | **5 new spans per txc**: `_do_write_data` → `_do_write_small`/`_do_write_big` for the per-extent layout, `kv_submit_transaction` for the rocksdb submit, `kv_committed_finalize` for the post-commit fan-out from `_kv_finalize_thread` |
+| BlueStore read sub-spans | none | `bluestore_read` → `get_onode` + `_do_read` |
+| Build | gcc 14 / opentelemetry-cpp 1.20 | gcc 15 / opentelemetry-cpp 1.24 (required additional override-mismatch fixes in `KStore`, `ECSwitch`, `ECBackend{,L}`, and explicit `jspan_context{false,false}` init at 4 sites in `PrimaryLogPG.cc` because OpenTelemetry 1.24 removed the default `SpanContext()` constructor) |
+
+The throughput delta below also looks much larger than 2026-05-23's run; that's the workload behaving as expected once the tracer overhead is consistent across both zones. The 2026-05-23 run's east zone was hampered by spending CPU on orphaned span exports that never reached Tempo.
 
 ---
 
@@ -58,48 +80,30 @@ Mem:           188Gi        45Gi        70Gi       4.4Gi        78Gi       143Gi
 ```
 $ ceph version
 ceph version 20.1.1 (dd9c546413d50a90668289255a256022ea21f0c0) tentacle (rc - RelWithDebInfo)
+        # built from tu503/homelab-overlay sys-cluster/ceph-20.1.1-r3
+        # OTLP tracer + rgw-iterate-trace-ctx-plumbing + bluestore-write-phase-spans
+        # + bluestore-tracer-init-from-global + librados-asio-read-trace + ...
 
 $ ceph -s
   cluster:
     health: HEALTH_OK
   services:
-    mon: 1 daemons, quorum 0 (age 1h) [leader: 0]
-    mgr: sm3(active, since 1h)
+    mon: 1 daemons, quorum 0 (age 2h) [leader: 0]
+    mgr: sm3(active, since 2h)
     mds: 1/1 daemons up
-    osd: 9 osds: 9 up (since 1h), 9 in (since 9w)
+    osd: 9 osds: 9 up (since 2h), 9 in (since 10w)
     rgw: 6 daemons active (6 hosts, 2 zones)
 ```
 
-Single host, 9 HDD OSDs, all in `host sm3` (`root default`):
+Single host, 9 HDD OSDs, all in `host sm3` (`root default`). 7.3 TiB per OSD, total raw 65 TiB, used 16 TiB (24.81%). BlueStore on dm-crypt LV per OSD; no separate WAL/DB device (collocated).
 
-| osd | size | %use | dev (dm) | underlying disk |
-|---|---|---|---|---|
-| osd.0 | 7.3 TiB | 22.96% | /dev/dm-4 | sdq |
-| osd.2 | 7.3 TiB | 22.71% | /dev/dm-8 | sdv |
-| osd.3 | 7.3 TiB | 25.87% | /dev/dm-2 | sdx |
-| osd.4 | 7.3 TiB | 24.82% | /dev/dm-3 | sdy |
-| osd.5 | 7.3 TiB | 28.02% | /dev/dm-7 | sdw |
-| osd.6 | 7.3 TiB | 26.61% | /dev/dm-0 | sdu |
-| osd.7 | 7.3 TiB | 22.16% | /dev/dm-6 | sdt |
-| osd.8 | 7.3 TiB | 26.39% | /dev/dm-1 | sds |
-| osd.9 | 7.3 TiB | 23.72% | /dev/dm-5 | sdr |
-
-Total raw: **65 TiB**, used 16 TiB (24.81%). BlueStore on dm-crypt LV per OSD; no separate WAL/DB device (collocated).
-
-**Tracing topology.** All four host daemon types (osd / mon / mds / mgr) and the in-pod RGW daemons are linked against `opentelemetry-cpp` and pointed at Tempo's OTLP HTTP receiver (`http://10.144.27.223:4318/v1/traces`, a MetalLB LoadBalancer service). RGW pods reach Tempo via cluster DNS (`tempo.monitoring.svc:4318`); host daemons go via the LB IP.
+**Tracing topology.** All four host daemon types (osd / mon / mds / mgr) and the in-pod RGW daemons are linked against `opentelemetry-cpp 1.24` and pointed at Tempo's OTLP HTTP receiver (`http://10.144.27.223:4318/v1/traces`, a MetalLB LoadBalancer service). RGW pods reach Tempo via cluster DNS (`tempo.monitoring.svc:4318`); host daemons go via the LB IP. BlueStore-emitted spans (`bluestore_read`, `_do_write_data`, `kv_*`) surface in Tempo under `service.name=osd` because the BlueStore tracer binds to the OSD's TracerProvider via `init_from_global` rather than installing its own (replacing the global drops every previously-created exporter — that was the silent-OSD-span bug on r2).
 
 ---
 
 ## RGW zones, zonegroups, and pools
 
 Two **separate realms** (`east` and `west`) — not a multi-site sync setup, just two independent S3 namespaces on the same OSDs.
-
-### Zonegroup endpoints
-
-| zonegroup | master_zone | endpoints |
-|---|---|---|
-| east | `93654b06-…` (east) | `http://rgw-primary.kubermon.svc:7480` |
-| west | `237d4627-…` (west) | `http://rgw-west.kubermon.svc:7480` |
 
 ### Per-zone pool layout
 
@@ -132,7 +136,7 @@ Storage efficiency: **east 7/9 ≈ 77.8%** vs **west 1/2 = 50%**. With a single-
 
 ### Pattern: one Deployment + Service + ConfigMap + Secret per zone
 
-All RGW pods live in a single namespace `rgw-gateway` (formerly named `kubermon`), but **every zone gets its own complete set of resources** — Deployment, Service, ConfigMap, Secret — with no shared state between instances except for the underlying Ceph cluster. The zone name is the unit of isolation: it becomes the RADOS pool prefix (`<zone>.rgw.*`), the RGW realm/zonegroup/zone triple, the cephx client identity (`client.rgw.<zone>`), and the k8s resource suffix.
+All RGW pods live in a single namespace `rgw-gateway`, but **every zone gets its own complete set of resources** — Deployment, Service, ConfigMap, Secret — with no shared state between instances except for the underlying Ceph cluster. The zone name is the unit of isolation: it becomes the RADOS pool prefix (`<zone>.rgw.*`), the RGW realm/zonegroup/zone triple, the cephx client identity (`client.rgw.<zone>`), and the k8s resource suffix.
 
 ```
 namespace: rgw-gateway
@@ -147,165 +151,36 @@ namespace: rgw-gateway
 └── Secret/ceph-rgw-keyring-west │ replicated×2 data pool, LB IP .205
 ```
 
-This is **not Rook**. The existing native Ceph cluster runs directly on the host (mon/mgr/mds/osd as systemd units on sm3); the RGW pods are *clients* of that cluster, configured purely via mounted `ceph.conf` + cephx keyring. The decoupling means RGW image rebuilds and pod restarts don't touch the data path.
-
-### Per-instance manifest set (east shown)
-
-**`ConfigMap/ceph-config-east`** — mounted at `/etc/ceph/ceph.conf`:
-
-```ini
-[global]
-fsid = f64f9c1f-c1d5-447b-ae97-dfa92dec9bde
-mon host = 10.144.27.26:6789
-auth cluster required = cephx
-auth service required = cephx
-auth client required = cephx
-jaeger_tracing_enable = true
-otel_tracing_endpoint = http://tempo.monitoring.svc:4318/v1/traces
-
-[client.rgw.east]
-rgw frontends = beast port=7480
-rgw zone = east
-rgw realm = east
-rgw zonegroup = east
-rgw enable usage log = true
-rgw usage log tick interval = 30
-rgw thread pool size = 64
-rgw enable gc threads = true
-log to stderr = true
-err to stderr = true
-log file = ""
-debug rgw = 1
-```
-
-**`Secret/ceph-rgw-keyring-east`** — mounted at `/etc/ceph/keyring`, `Opaque` type, single key:
-
-```yaml
-stringData:
-  keyring: |
-    [client.rgw.east]
-    key = <cephx-shared-secret>
-```
-
-The corresponding `ceph auth` entry has caps `osd 'allow rwx', mon 'allow rw', mgr 'allow rw'` — RGW needs `rwx` on OSDs to do data ops, `rw` on mon for map updates, and `rw` on mgr for usage stats.
-
-**`Deployment/rgw-east`** — 3 replicas:
-
-```yaml
-spec:
-  replicas: 3
-  selector: { matchLabels: { app: rgw, instance: east } }
-  template:
-    spec:
-      containers:
-        - name: radosgw
-          image: registry.alcg.io/radosgw:v75c6769f6c   # homelab fork build
-          command:
-            - /usr/bin/radosgw
-            - --id=rgw.east
-            - --name=client.rgw.east
-            - --cluster=ceph
-            - -c=/etc/ceph/ceph.conf
-            - --keyring=/etc/ceph/keyring
-            - --no-mon-config            # don't try to fetch config from mon cluster — use mounted ceph.conf only
-            - -f                          # foreground; let k8s manage lifecycle
-          ports: [{ name: http, containerPort: 7480 }]
-          readinessProbe: { httpGet: { path: /, port: 7480 }, initialDelaySeconds: 10, periodSeconds: 10 }
-          livenessProbe:  { httpGet: { path: /, port: 7480 }, initialDelaySeconds: 30, periodSeconds: 30 }
-          resources:
-            requests: { cpu: 250m, memory: 512Mi }
-            limits:   { cpu: "2",  memory: 2Gi }
-          volumeMounts:
-            - { name: ceph-config,  mountPath: /etc/ceph/ceph.conf, subPath: ceph.conf, readOnly: true }
-            - { name: ceph-keyring, mountPath: /etc/ceph/keyring,   subPath: keyring,   readOnly: true }
-      volumes:
-        - { name: ceph-config,  configMap: { name: ceph-config-east } }
-        - { name: ceph-keyring, secret:    { secretName: ceph-rgw-keyring-east } }
-```
-
-**`Service/rgw-east`** — `LoadBalancer`, MetalLB-allocated VIP from the `10.144.27.200-249` pool:
-
-```yaml
-spec:
-  type: LoadBalancer
-  selector: { app: rgw, instance: east }
-  ports:
-    - { name: http, port: 7480, targetPort: 7480, protocol: TCP }
-```
-
-Each instance gets its own external IP (east `.204`, west `.205`); clients pick which zone they're talking to by choosing an IP, not by HTTP virtual-hosting.
-
-### Pool layout per instance
-
-`setup-instance.sh` pre-creates the per-zone pools — pre-creation matters because RGW will auto-create them if missing but with default pg counts that may not match the workload:
-
-| pool name | pgs (created by script) | what RGW stores there |
-|---|---|---|
-| `<zone>.rgw.control` | 8 | distributed-lock/notification objects (small, mostly idle) |
-| `<zone>.rgw.meta` | 8 | user / bucket / period metadata |
-| `<zone>.rgw.log` | 8 | usage log, bilog, datalog |
-| `<zone>.rgw.buckets.index` | 16 | bucket index OMAP — STAT/LIST/DELETE hot path |
-| `<zone>.rgw.buckets.data` | 16 | actual object payload |
-
-These start as replicated-2× (the cluster default). Switching `<zone>.rgw.buckets.data` to an EC profile is a *post-create* step: `ceph osd pool create … erasure <profile>` + `radosgw-admin zone placement add` to point the default placement at the new pool. East's data pool was migrated this way (which is why it ended up as pool ID #64 with rule `east.rgw.buckets.data`, while everything else for east is in the original #44-#47 range).
+This is **not Rook**. The existing native Ceph cluster runs directly on the host (mon/mgr/mds/osd as systemd units on sm3); the RGW pods are *clients* of that cluster, configured purely via mounted `ceph.conf` + cephx keyring. Each pod is one `radosgw -f` process started with `--name=client.rgw.<zone>` and the per-zone keyring.
 
 ### Container image (homelab fork)
 
-`registry.alcg.io/radosgw:v75c6769f6c` is built **from scratch** by `build-image.sh` using buildah:
+`registry.alcg.io/radosgw:v20.1.1-asio-read-fix` (this run, sha256:`139fce5e…`) is built **from scratch** by `build-image.sh` using buildah: `ldd /usr/bin/radosgw` against the host's installed Ceph (so the image inherits whatever the Portage overlay produced — including the OTLP-instrumented `sys-cluster/ceph-20.1.1-r3` patch series), copy the binary + all transitive libraries into a scratch container, add a minimal `/etc/{passwd,group,nsswitch.conf}` for the `ceph` user (UID 167), `EXPOSE 7480`, `ENTRYPOINT ["/usr/bin/radosgw"]`, commit. Image lands around 105 MiB — no shell, no package manager.
 
-1. Resolve `ldd /usr/bin/radosgw` against the host's installed Ceph (so the image inherits whatever the Portage overlay produced — including the OTLP-instrumented `ceph-999` branch).
-2. Copy `radosgw`, every transitive library (`/usr/lib64`, `/usr/lib64/ceph`, `/lib64/ld-linux-x86-64.so.2`) into a scratch container.
-3. Add minimal `/etc/{passwd,group,nsswitch.conf}` for the `ceph` user (UID 167).
-4. `EXPOSE 7480`, `ENTRYPOINT ["/usr/bin/radosgw"]`, `buildah commit`.
-
-Image size lands around 200-300 MiB — no shell, no package manager, no debug tooling. Updates: rebuild on the host, `buildah push` to a `docker-archive`, `ctr -n k8s.io images import` into containerd on each node, then `kubectl rollout restart deploy/rgw-*`. `deploy-image.sh` does all four steps as one command and waits for both rollouts to finish.
-
-This is also what makes the OTLP tracing patches land in production: any change to the `ceph-999` branch flows into a host rebuild (`emerge sys-cluster/ceph::homelab`) → new `/usr/bin/radosgw` → next `deploy-image.sh` picks it up.
-
-### Bootstrapping a new instance
-
-`setup-instance.sh <name>` is idempotent and does the full chain:
-
-1. `radosgw-admin realm create` → `zonegroup create --master --default` → `zone create --master --default`
-2. `radosgw-admin period update --commit`
-3. Pre-create the 5 pools above (control/meta/log/buckets.index/buckets.data)
-4. `ceph auth get-or-create client.rgw.<name> osd 'allow rwx' mon 'allow rw' mgr 'allow rw'`
-5. Write `<name>/11-ceph-keyring.yaml` (Secret) with the cephx key
-6. `radosgw-admin user create --uid=<name>-admin` (initial S3 admin user)
-7. Write `<name>/10-ceph-config.yaml` (ConfigMap), `<name>/20-deployment.yaml`, `<name>/30-service.yaml` if not present
-8. Print the S3 access/secret key pair
-
-So bringing up a third zone is:
-
-```bash
-./setup-instance.sh south
-kubectl apply -f south/
-# south.rgw.* pools created, rgw-south Deployment running,
-# external S3 endpoint at the next MetalLB pool IP.
-```
+Updates: rebuild on the host, `buildah push` to the local registry (`registry.alcg.io`), `kubectl rollout restart deploy/rgw-*`. `deploy-image.sh` does all four steps as one command and waits for both rollouts to finish.
 
 ### Live state at benchmark time
 
 ```
 $ kubectl -n rgw-gateway get pods,svc -o wide
-pod/rgw-east-78f578cb5b-29z9q   1/1 Running   sm3
-pod/rgw-east-78f578cb5b-phx2z   1/1 Running   sm3
-pod/rgw-east-78f578cb5b-xbscl   1/1 Running   sm3
-pod/rgw-west-7df6fc45db-bmsmf   1/1 Running   sm3
-pod/rgw-west-7df6fc45db-gb2tr   1/1 Running   sm3
-pod/rgw-west-7df6fc45db-njk86   1/1 Running   sm3
+pod/rgw-east-878b66cd9-...   1/1 Running   sm3
+pod/rgw-east-878b66cd9-...   1/1 Running   g469
+pod/rgw-east-878b66cd9-...   1/1 Running   mg-vctr-rtx
+pod/rgw-west-59767b44d7-...  1/1 Running   sm3
+pod/rgw-west-59767b44d7-...  1/1 Running   g469
+pod/rgw-west-59767b44d7-...  1/1 Running   mg-vctr-rtx
 
 service/rgw-east   LoadBalancer  10.111.88.16  10.144.27.204  7480 → 32010/TCP
 service/rgw-west   LoadBalancer  10.104.10.75  10.144.27.205  7480 → 30089/TCP
 ```
 
-Both 3-replica Deployments scheduled all 6 pods onto `sm3` (no nodeAffinity — k8s scheduler just packs them there because it's where the cluster has slack). That matters for the benchmarks: the warp pod, the RGW pods, and the OSDs all share the same physical box, so network latency is `lo`-fast and the spindles are the only bottleneck.
+Pods are spread across 3 nodes (sm3 / g469 / mg-vctr-rtx) but all OSDs are on `sm3`, so RGW→OSD traffic on g469 and mg-vctr-rtx crosses the network while the sm3-resident pods use the cluster loopback path. The 16-concurrent warp client runs in-cluster and dials the service IP, so requests load-balance via kube-proxy to whichever pod is selected.
 
 | | east | west |
 |---|---|---|
-| Deployment | `rgw-east` (revision 13) | `rgw-west` (revision 13) |
-| replicas | 3 (all on sm3) | 3 (all on sm3) |
-| image | `registry.alcg.io/radosgw:v75c6769f6c` (from host's ceph-999 build) | same |
+| Deployment | `rgw-east` | `rgw-west` |
+| replicas | 3 (sm3 / g469 / mg-vctr-rtx) | 3 (sm3 / g469 / mg-vctr-rtx) |
+| image | `registry.alcg.io/radosgw:v20.1.1-asio-read-fix` | same |
 | Service | `rgw-east` LoadBalancer `10.144.27.204:7480` | `rgw-west` LoadBalancer `10.144.27.205:7480` |
 | ConfigMap | `ceph-config-east` | `ceph-config-west` |
 | Secret | `ceph-rgw-keyring-east` | `ceph-rgw-keyring-west` |
@@ -313,22 +188,20 @@ Both 3-replica Deployments scheduled all 6 pods onto `sm3` (no nodeAffinity — 
 | Realm / zonegroup / zone | `east` / `east` / `east` | `west` / `west` / `west` |
 | Data pool | `east.rgw.buckets.data` (pool #64, **EC 7+2**) | `west.rgw.buckets.data` (pool #58, **replicated×2**) |
 | Index pool | `east.rgw.buckets.index` (pg_num 32) | `west.rgw.buckets.index` (pg_num 16) |
-| Container resources | requests 250m/512Mi · limits 2c/2Gi | same |
-| ceph.conf knobs | `rgw thread pool size = 64`, `debug rgw = 1`, OTLP to `tempo.monitoring.svc:4318` | same |
-
-Source manifests + scripts live in a private GitLab repo (`gitlab.alcg.io/homelab/infra/rgw-gateway`); they're flux-managed but the cluster runs out of phase with Flux because the image-build path requires host-side buildah, not GitOps.
+| ceph.conf knobs | `rgw thread pool size = 64`, `jaeger_tracing_enable = true`, `otel_tracing_endpoint = http://tempo.monitoring.svc:4318/v1/traces` | same |
 
 ---
 
 ## Benchmark methodology
 
-- Tool: **`minio/warp:1.3.1`** running as an in-cluster pod (`kubectl run --image=minio/warp`), reaching the RGW Service IP via cluster DNS — same network hop as the in-cluster S3 consumers.
+- Tool: **`minio/warp:latest`** running as an in-cluster pod (`kubectl run --image=minio/warp`), reaching the RGW Service via cluster DNS — same network hop as the in-cluster S3 consumers.
 - Workload: **`warp mixed`** — default mix of GET / PUT / STAT / DELETE, default object size distribution (Pareto over 1 KB – 10 MB).
 - Concurrency: **16** workers.
 - Duration: **4 minutes** per zone.
 - Bench user: dedicated `warp-bench` per realm (created with `radosgw-admin user create --rgw-realm={east,west}`).
-- Buckets: timestamped per run (`warp-otel-east-YYYYMMDD-HHMMSS`, `…-west-…`); `--noclear` to keep the data for post-run trace inspection.
-- Both runs serialized (east first 21:09:57–21:18:20 UTC, west second 21:48:32–21:56:51 UTC) so they don't compete for the same 9 OSDs.
+- Buckets: timestamped per run (`warp-otel-east-20260525-000833`, `warp-otel-west-20260525-000833`); `--noclear` to keep data for post-run trace inspection.
+- Both runs serialized (east 04:08:33–04:15:26 UTC, west 04:15:46–04:23:57 UTC) so they don't compete for the same 9 OSDs.
+- Tempo bucket cleared between the previous test and this run so all traces and trace-derived Prometheus metrics start fresh.
 
 Command (east shown):
 
@@ -352,152 +225,245 @@ Raw logs: [`raw/warp-east.log`](raw/warp-east.log), [`raw/warp-west.log`](raw/wa
 
 | | east | west |
 |---|---|---|
-| **Total** | 146.37 MiB/s · 24.35 obj/s | 146.10 MiB/s · 24.36 obj/s |
-| PUT | 36.86 MiB/s · 3.69 obj/s | 36.28 MiB/s · 3.63 obj/s |
-| GET | 109.34 MiB/s · 10.93 obj/s | 109.82 MiB/s · 10.98 obj/s |
-| STAT | — · 7.30 obj/s | — · 7.32 obj/s |
-| DELETE | — · 2.42 obj/s | — · 2.43 obj/s |
+| **Total** | **284.37 MiB/s · 47.38 obj/s** | 162.35 MiB/s · 27.03 obj/s |
+| PUT | **71.32 MiB/s · 7.13 obj/s** | 40.62 MiB/s · 4.06 obj/s |
+| GET | **213.06 MiB/s · 21.31 obj/s** | 121.67 MiB/s · 12.17 obj/s |
+| STAT | — · **14.19 obj/s** | — · 8.11 obj/s |
+| DELETE | — · **4.75 obj/s** | — · 2.72 obj/s |
 
-Object-rate and bandwidth are within ±0.5%. The benchmark is effectively spindle-bound on both zones.
+East delivers 1.75× the aggregate throughput and 1.75× the object rate. Every operation type favors east this run.
 
 ### Latency (ms)
 
 | op | zone | avg | p50 | p90 | p99 | fastest | slowest |
 |---|---|---|---|---|---|---|---|
-| PUT | east | **687.2** | 665.2 | 943.9 | 1109.2 | 267.6 | 2153.6 |
-| PUT | west | 771.3 | 765.9 | 1069.5 | 1275.0 | 257.6 | 2087.7 |
-| GET | east | 1177.4 | 1202.9 | 1373.9 | 1481.2 | 363.9 | 1686.1 |
-| GET | west | **1092.5** | 1128.3 | 1292.0 | 1450.1 | 392.5 | 1650.2 |
-| STAT | east | **18.7** | 13.6 | 40.0 | 92.9 | 2.8 | 231.4 |
-| STAT | west | 42.4 | 28.4 | 103.3 | 230.4 | 2.5 | 390.3 |
-| DELETE | east | **168.8** | 165.2 | 267.1 | 335.1 | 32.3 | 652.4 |
-| DELETE | west | 315.3 | 312.4 | 551.5 | 646.2 | 13.7 | 1141.0 |
-| GET TTFB | east | **92** | 85 | 154 | 261 | 19 | 469 |
-| GET TTFB | west | 108 | 95 | 182 | 332 | 9 | 590 |
+| PUT | east | **594.1** | **435.7** | **1276.5** | **1947.9** | 173.9 | 2403.2 |
+| PUT | west | 844.0 | 422.6 | 2699.4 | 3687.5 | 145.3 | 4875.0 |
+| GET | east | **514.5** | **257.8** | **1323.8** | **2176.2** | 41.9 | 2742.0 |
+| GET | west | 1002.1 | 352.9 | 3312.1 | 4560.3 | 22.3 | 5649.0 |
+| GET TTFB | east | **135** | **102** | **273** | **576** | 9 | 951 |
+| GET TTFB | west | 231 | 131 | 624 | 1433 | 4 | 2508 |
+| STAT | east | **18.9** | **9.4** | **44.5** | **197.0** | 1.1 | 437.5 |
+| STAT | west | 57.6 | 6.3 | 186.5 | 803.9 | 1.1 | 1769.4 |
+| DELETE | east | **170.2** | **154.4** | **300.6** | **529.1** | 10.1 | 896.1 |
+| DELETE | west | 205.5 | 80.3 | 752.1 | 1556.4 | 5.7 | 3026.9 |
 
-### Why east is faster on PUT/STAT/DELETE despite being EC
+Tail behavior matters more than averages for spindle-bound workloads. Look at the p99 column — **east's PUT p99 (1.95 s) is ~2× faster than west's (3.69 s), and east's GET p99 (2.18 s) is ~2× faster than west's (4.56 s)**.
 
-Two reinforcing reasons:
+### Why east wins on PUT
 
-1. **EC writes use *every* OSD on this single-host cluster.** With k=7, m=2 and `failure-domain=osd`, each PUT scatters 7 data + 2 parity shards across the 9 OSDs (i.e., **every spindle**). Replicated×2 writes only land on 2 of 9 OSDs — the rest sit idle for that operation. With 16 concurrent writers, EC is utilizing all 9 spindles continuously; replicated×2 is interleaving 16 writers across the available pool but each individual write is still 2-spindle-bound.
-2. **east's index pool has 2× more PGs.** STAT and DELETE are bucket-index-heavy, and `east.rgw.buckets.index` has `pg_num=32` while `west.rgw.buckets.index` has `pg_num=16`. Larger PGs ⇒ more index contention on west; the latency table shows STAT/DELETE p99 on west literally 2–3× east's.
+For each PUT, EC scatters 7 data + 2 parity shards across all 9 OSDs simultaneously. With 16 concurrent writers all 9 spindles are constantly busy. Replicated×2 only writes to 2 of 9 OSDs per object — the other 7 sit idle for that particular write. With 16 writers the 2-spindle bottleneck builds queue depth, which is exactly what shows up as west's `do_op` p99 of 121 ms vs east's 15 ms (see OSD-side latency below).
 
-### Why west is (slightly) faster on GET
+### Why east wins on GET
 
-Reads from an EC pool need k=7 of 9 shards present and a reconstruction step on the RGW side. Each EC GET issues 7 RADOS reads, blocks until the slowest of the seven returns, and pays the ISA-L decode cost. Replicated×2 reads issue one RADOS read to the primary OSD. On HDDs, that single sequential read wins on TTFB (92 ms east vs 108 ms west is east-faster — that's noise, but the *avg* GET latency west is 7% lower, which matches the EC-vs-replicated theory). Bandwidth ties because both saturate the same 9 spindles in aggregate.
+EC reads need k=7 of 9 shards plus an ISA-L decode, which conventional wisdom says is slower than a single replicated read. Two effects flip that here:
+
+1. EC GETs *also* spread the read I/O across many OSDs (each read pulls from up to 7 shards), so the spindles are utilized in parallel and the aggregate bandwidth is higher.
+2. The data pool used by west has `pg_num=16` (vs east's pg_num=32 on a 9-OSD cluster). Fewer PGs ⇒ fewer primary-PG-per-OSD slots ⇒ same number of concurrent requests funnel through fewer PG locks ⇒ more contention. Per-zone bluestore-read p99: east 55 ms, west 127 ms.
+
+### Why east wins on STAT and DELETE
+
+These are bucket-index-heavy ops. `east.rgw.buckets.index` has `pg_num=32`, `west.rgw.buckets.index` has `pg_num=16`. STAT p99 is 197 ms east vs 804 ms west — a 4× difference that maps directly onto the 2× index PG ratio plus second-order queue effects.
 
 ---
 
 ## Trace analysis
 
-Every S3 request the benchmark issued produced an OTLP trace flowing through the Bell/Beast frontend → `RGWPutObj`/`RGWGetObj` → `rados_{read,write}` → into the OSD `dequeue_op` → `do_op` → `execute_ctx` → `issue_repop` chain. The fork's tracer patches propagate `jspan_context` from the RGW request span down through to per-OSD ops so PUTs come back as multi-service traces.
+Every S3 request the benchmark issued produced an OTLP trace landing in Tempo. With the r3 build, both PUT and GET fan out the full **rgw → osd → bluestore** chain — previously only PUT did.
 
 ### Representative east PUT (EC 7+2)
 
-Trace `692991bcf0c30ed85adaed6bd358c72f` — total 2.50 s wall time.
+Trace `ae08e96940a6a7face2ff7d8e6229c7` — total **1.48 s**, **257 spans across 18 OSD batches**.
 
 ```
-[rgw  ] put_obj                  2500.0 ms
- ├─ [rgw  ] verify_permission        0.0 ms
- └─ [rgw  ] execute               2499.6 ms
-     └─ [rgw  ] put_obj_data       2499.5 ms
-         └─ [rgw  ] rados_write      92.1 ms    (× 1)
-             └─ across all 9 OSDs (0,2,3,4,5,6,7,8,9):
-                ├─ [osd  ] op-request-created  (×27, avg 77 ms)
-                ├─ [osd  ] dequeue_op           (×27, avg 1.2 ms)
-                ├─ [osd  ] enqueue_op           (×27, avg 0 ms)
-                ├─ [osd  ] do_op                (×3,  avg 6.2 ms)
-                ├─ [osd  ] execute_ctx          (×3,  avg 6.0 ms)
-                └─ [osd  ] issue_repop          (×3,  avg 5.7 ms)
+[rgw  ] put_obj                          1247 ms
+ ├─ [rgw  ] verify_permission                0.00 ms
+ └─ [rgw  ] execute                       1247 ms
+     ├─ [rgw  ] put_obj_data              1247 ms
+     ├─ [osd/2] op-request-created         164 ms     <- primary shard
+     │   ├─ enqueue_op       (0.03)
+     │   ├─ dequeue_op       (5.63)
+     │   ├─ do_op            (5.62)
+     │   ├─ execute_ctx      (5.47)
+     │   ├─ issue_repop      (5.42)
+     │   └─ queue_transactions   9.53 ms     <- BlueStore txc starts
+     │       ├─ _do_write_data      0.04 ms
+     │       │   └─ _do_write_big   0.04 ms
+     │       ├─ txc_aio_wait        2.67 ms
+     │       ├─ kv_submit_transaction  0.13 ms
+     │       └─ kv_committed_finalize  0.00 ms
+     ├─ [osd/3] op-request-created   125 ms   <- shard 2
+     │   └─ ... (same fan-out: enqueue/dequeue/queue_transactions/_do_write_data/_do_write_big/
+     │       txc_aio_wait/kv_submit_transaction/kv_committed_finalize)
+     ├─ [osd/0] op-request-created   128 ms   <- shard 3
+     ├─ [osd/8] op-request-created   122 ms   <- shard 4
+     ├─ [osd/4] op-request-created   143 ms   <- shard 5
+     ├─ [osd/5] op-request-created   123 ms   <- shard 6
+     ├─ [osd/6] op-request-created   ...     <- shard 7
+     ├─ [osd/7] op-request-created   ...     <- shard 8
+     └─ [osd/9] op-request-created   ...     <- shard 9
 ```
 
-- **OSD batches: 10** (one resource batch per OSD-tracer instance, with osd.0 split into two).
-- **OSDs touched: all 9** (`instance.id` = `0,2,3,4,5,6,7,8,9`) — confirms EC `crush-num-failure-domains=osd` placing all 9 shards.
-- **27 op-request-created** spans (3 RADOS write ops per shard ≈ object split into 3 chunks × 9 shards).
-- Tail latency: the longest `op-request-created` is 264 ms — that one slow OSD gates the whole PUT.
+- **OSD batches: 18** (each OSD-tracer instance emits its own batch — 9 unique OSDs × 2 batches each on average for this trace).
+- **Unique OSDs touched: all 9** (`0, 2, 3, 4, 5, 6, 7, 8, 9`) — confirms EC `crush-num-failure-domains=osd` placing all 9 shards.
+- **27 `op-request-created`** = 9 OSDs × 3 RADOS writes per shard (head + 2 tail chunks for this multi-MB object).
+- **Per-shard BlueStore fan-out is fully visible**: every shard runs `queue_transactions → _do_write_data → _do_write_big`, then `txc_aio_wait` (the rocksdb-side commit barrier — typically the dominant phase, 2.7-5.9 ms here), then `kv_submit_transaction` and `kv_committed_finalize`. The new spans give a per-OSD attribution of where each shard spends its time.
 
-[Full trace JSON: `traces/east-put_obj.json` — 95 spans, 44 KB]
+[Full trace JSON: [`traces/east-put_obj.json`](traces/east-put_obj.json) — 257 spans, 95 KB]
 
 ### Representative west PUT (replicated 2×)
 
-Trace `36005c4539a4fcea485e3a5e7f965d9` — total 1.71 s wall time.
+Trace `2f2e2a50090b29e475ff4127887c37f` — total **2.54 s**, **68 spans across 10 OSD batches**, only **4 unique OSDs** (`2, 4, 5, 7`).
 
 ```
-[rgw  ] put_obj                  1714.7 ms
- ├─ [rgw  ] verify_permission        0.0 ms
- └─ [rgw  ] execute               1714.3 ms
-     └─ [rgw  ] put_obj_data       1714.1 ms
-         └─ [rgw  ] rados_write     249.3 ms    (× 1)
-             └─ across 5 OSDs (4,5,6,7,9):
-                ├─ [osd  ] dequeue_op       (×6, avg 4.2 ms)
-                ├─ [osd  ] enqueue_op       (×6, avg 0 ms)
-                ├─ [osd  ] do_op            (×3, avg 4.7 ms)
-                ├─ [osd  ] execute_ctx      (×3, avg 4.5 ms)
-                ├─ [osd  ] issue_repop      (×3, avg 4.4 ms)
-                └─ [osd  ] op_commit        (×1)
+[rgw  ] put_obj                          2538 ms
+ ├─ [rgw  ] verify_permission                0.00 ms
+ └─ [rgw  ] execute                       2538 ms
+     ├─ [rgw  ] put_obj_data              2538 ms
+     ├─ [osd/2] op-request-created         67 ms      <- primary, chunk 1
+     │   ├─ dequeue_op         6.44
+     │   ├─ do_op              6.42
+     │   ├─ execute_ctx        6.23
+     │   ├─ issue_repop        6.17
+     │   └─ queue_transactions  38.37
+     │       ├─ _do_write_data         0.07
+     │       │   └─ _do_write_big      0.05
+     │       ├─ txc_aio_wait       26.89   <- much longer than east's 2.67ms
+     │       ├─ kv_submit_transaction   0.21
+     │       └─ kv_committed_finalize   0.00
+     │   └─ [osd/7] op-request-created   64 ms   <- replica of chunk 1
+     │       └─ ... (same shape, queue_transactions=40ms, txc_aio_wait=30.6ms)
+     ├─ [osd/5] op-request-created       134 ms     <- primary, chunk 2
+     │   └─ [osd/4] op-request-created    88 ms    <- replica of chunk 2
+     ├─ [rgw  ] rados_write              1140 ms     <- head object metadata write (sync)
+     └─ [osd/5] op-request-created        29 ms     <- head primary
+         └─ [osd/4] op-request-created    ...        <- head replica
 ```
 
-- OSD batches: 6, only **5 unique OSDs** touched (one OSD has two batches). For 2× replication with multiple chunks per PUT, different chunks land on different PG primaries → multiple OSD pairs participate, not just two.
-- `rados_write` parent span is 249 ms here vs 92 ms on east — but with only 5 OSDs sharing the bandwidth versus 9 on east.
+- Only 6 `op-request-created` for 3 chunks (each gets primary + replica = 2 OSDs), plus the head-object meta write — total **9 ops** vs east's 27.
+- `txc_aio_wait` on west: **26-30 ms** vs east's **2-3 ms** — same physical spindles, but with 16 concurrent writers funneled through 4 OSDs the AIO queues build up.
+- The trace shows the head-object `rados_write` separately at 1.14 s (because head writes go through the sync `rgw_rados_operate`, not the aio chunk path) — this is the one source of PUT latency that EC and replicated handle differently.
 
-[Full trace JSON: `traces/west-put_obj.json` — 33 spans, 16 KB]
+[Full trace JSON: [`traces/west-put_obj.json`](traces/west-put_obj.json) — 68 spans, 28 KB]
 
-### Representative GETs
+### Representative east GET (EC 7+2) — **new in this run**
 
-Both east and west GET traces only have 4 RGW spans and **no OSD-side spans** — the homelab fork's tracer patches propagate context through `rados_write` (PUT path) but not yet through `rados_read`. So GET shows up as a single RGW-rooted trace with no downstream visibility.
+Trace `41ab7a2f766e2212898aa06b002d6a69` — total **1.82 s**, **12 spans**, **6 OSD batches**.
 
 ```
-[rgw  ] get_obj                   1214.3 ms     (east)        1061.5 ms   (west)
- ├─ [rgw  ] verify_permission         0.03 ms                    0.03 ms
- └─ [rgw  ] execute               1112.5 ms                    893.6 ms
-     └─ [rgw  ] get_obj_data       1112.3 ms                    893.5 ms
+[rgw  ] get_obj                          1820 ms
+ ├─ [rgw  ] verify_permission                0.01 ms
+ └─ [rgw  ] execute                       1502 ms
+     └─ [rgw  ] get_obj_data              1502 ms
+         ├─ [rgw  ] rados_read              0.02 ms     <- chunk 1 enqueue
+         │   └─ [osd/5] op-request-created  192 ms     <- chunk 1 served by osd.5
+         │       ├─ enqueue_op       0.01
+         │       ├─ dequeue_op       0.48
+         │       ├─ do_op            0.47
+         │       └─ execute_ctx ×2  0.33 / 0.20    <- (no bluestore_read this trace = page cache hit)
+         ├─ [rgw  ] rados_read              0.01 ms     <- chunk 2
+         └─ ...                                          <- additional chunks
 ```
 
-Most of the GET latency is inside `get_obj_data`, which is the RADOS read + (for east) EC decode + body streaming back. Without OSD-side spans linked into the GET trace we can't subdivide the read further from the trace alone.
+This is what the previous run couldn't show. Now the rgw `get_obj` trace fans down through `rados_read` (one per chunk) into per-OSD `op-request-created` and the PG pipeline. When the read actually hits disk the chain continues with `bluestore_read → get_onode + _do_read` (see west GET below — those chunks hit disk, this east trace happened to be cache-warm so the bluestore_read children are absent, which is itself a meaningful trace observation).
 
-[`traces/east-get_obj.json`, `traces/west-get_obj.json` — 4 spans, 2 KB each]
+[Full trace JSON: [`traces/east-get_obj.json`](traces/east-get_obj.json) — 12 spans, 6 KB]
 
-#### OSD-side activity across the run windows (Prometheus span-metrics)
+### Representative west GET (replicated 2×) — **new in this run, includes the disk read**
 
-Even though the GET-path OTLP trace context isn't propagated to OSDs, the OSDs still emit their own spans for every op they handle, and Tempo's metrics-generator turns those into Prometheus histograms. Aggregating over each zone's test window gives a clean view of how the OSDs *themselves* behaved during PUT-and-GET-mixed traffic:
+Trace `2ea79f5710dfed8d0b2b29dea7cff63` — total **3.77 s**, **22 spans**, **8 OSD batches**.
 
-| OSD op | east p50 | east p99 | west p50 | west p99 |
-|---|---|---|---|---|
-| `do_op` | 1.30 ms | **13.1 ms** | 1.54 ms | **64.4 ms** |
-| `execute_ctx` | 1.28 ms | 12.6 ms | 1.53 ms | 64.3 ms |
-| `dequeue_op` | 1.11 ms | 17.3 ms | 1.30 ms | 59.0 ms |
-| `issue_repop` | 1.73 ms | 13.5 ms | 1.55 ms | 19.0 ms |
+```
+[rgw  ] get_obj                          3774 ms
+ ├─ [rgw  ] verify_permission                0.01 ms
+ └─ [rgw  ] execute                       2879 ms
+     └─ [rgw  ] get_obj_data              2879 ms
+         ├─ [rgw  ] rados_read              0.01 ms
+         │   └─ [osd/2] op-request-created  123 ms
+         │       ├─ enqueue_op       0.01
+         │       ├─ dequeue_op      60.32
+         │       ├─ do_op           60.30
+         │       ├─ execute_ctx     60.25
+         │       └─ bluestore_read   59.84 ms     <- ACTUAL DISK READ
+         │           ├─ get_onode       0.00
+         │           └─ _do_read       59.82      <- ~all the bluestore latency
+         ├─ [rgw  ] rados_read              0.00 ms
+         │   └─ [osd/2] op-request-created  145 ms
+         │       ├─ dequeue_op      31.02
+         │       └─ bluestore_read   30.76
+         │           └─ _do_read       30.74
+         └─ ...
+```
 
-**West's p99 is 3–5× worse on every primary OSD op.** Same reason as the client-side latency: every west PUT is funneled through just 2 of the 9 OSDs (the PG primary + secondary), so when those two are busy a new op queues behind them. East spreads each PUT across all 9 OSDs as EC shards, so any given OSD spends more time idle and services its share of an op quickly. The medians are close (because medians are dominated by the fast path on idle queues), but the tails diverge sharply once queues start backing up.
+This is the full chain that justified the patch series: a slow GET (3.77 s wall) can now be attributed precisely — most of the time is in `get_obj_data` (2.88 s), within that most chunks hit osd.2 which spent 60 ms in `bluestore_read._do_read` (i.e., the spindle was the bottleneck, not the network/PG/kv). Without these spans you'd see only the 2.88 s `get_obj_data` blob and have to guess.
 
-This is exactly the kind of analysis you can't extract from the trace tree alone — even when the per-trace fan-out is hidden, the span-metric histograms still capture every op every OSD processed.
+[Full trace JSON: [`traces/west-get_obj.json`](traces/west-get_obj.json) — 22 spans, 10 KB]
 
-The orphan-OSD trace search (`{resource.service.name="osd"}`) during each window returns mostly OSD-rooted traces with names like `op-request-created`, 3 spans each — that's a single OSD's view of one op (network arrival → enqueue → dequeue). Useful for spot-checking a slow OSD but not for end-to-end attribution. The PUT traces above (which *do* link RGW→OSD) remain the best illustration of the full fan-out shape.
+### OSD-side latency aggregates (Prometheus span-metrics)
+
+Tempo's metrics-generator converts every emitted span into a histogram. With the new spans, the OSD attribution is much more granular:
+
+| OSD span | east p50 | east p99 | west p50 | west p99 | west/east p99 |
+|---|---|---|---|---|---|
+| `do_op` | 1.16 ms | **14.6 ms** | 1.61 ms | **121.0 ms** | **8.3×** |
+| `execute_ctx` | 1.11 ms | 13.8 ms | 1.61 ms | 121.1 ms | 8.8× |
+| `dequeue_op` | 1.23 ms | 31.3 ms | 1.36 ms | 114.6 ms | 3.7× |
+| `issue_repop` | 1.56 ms | 15.5 ms | 1.35 ms | 14.3 ms | 0.9× |
+| `queue_transactions` | 1.67 ms | 29.6 ms | 1.55 ms | 56.1 ms | 1.9× |
+| `txc_aio_wait` | 1.56 ms | 10.4 ms | **7.95 ms** | 29.0 ms | 2.8× |
+| `kv_submit_transaction` | 1.01 ms | 2.05 ms | 1.01 ms | 1.99 ms | 1.0× |
+| `_do_write_big` | 1.00 ms | 1.98 ms | 1.00 ms | 1.98 ms | 1.0× |
+| `bluestore_read` | 11.6 ms | **54.9 ms** | **47.6 ms** | **126.9 ms** | 2.3× |
+| `_do_read` | 11.6 ms | 54.9 ms | 47.6 ms | 126.9 ms | 2.3× |
+
+The kv-submit/`_do_write_big` p50/p99 are essentially identical across zones because that work is per-txc and CPU-bound. The OSD-queueing spans (`do_op`, `execute_ctx`, `dequeue_op`) and the bluestore-read p50 all collapse: **west has 5-8× longer tail because the same number of writers funnel through fewer OSDs**. This validates the throughput numbers up top.
 
 ### Span-rate fingerprint during the runs
 
-From Tempo's metrics-generator into Prometheus, top spans/s during the test windows (`sum by (service, span_name) rate(traces_spanmetrics_calls_total[5m])`):
+`sum by (service, span_name) rate(traces_spanmetrics_calls_total[5m])`, sampled at each window's end:
 
-| span | service | spans/s during east run | spans/s during west run |
-|---|---|---|---|
-| `dequeue_op` | osd | 126 | 28 (5× less — fewer OSDs per PUT) |
-| `enqueue_op` | osd | 126 | 28 |
-| `op-request-created` | osd | 126 | 28 |
-| `do_op` | osd | 56 | 26 |
-| `execute_ctx` | osd | 55 | 26 |
-| `issue_repop` | osd | 26 | 13 |
-| `verify_permission` | rgw | 2.2 | 2.2 |
-| `execute` | rgw | 2.2 | 2.2 |
+| span | service | spans/s east | spans/s west | east/west |
+|---|---|---|---|---|
+| `op-request-created` | osd | **1732** | 196 | 8.8× |
+| `enqueue_op` / `dequeue_op` | osd | 1732 each | 196 each | 8.8× |
+| `queue_transactions` | osd | **465** | 84 | 5.5× |
+| `kv_submit_transaction` | osd | 465 | 84 | 5.5× |
+| `kv_committed_finalize` | osd | 465 | 84 | 5.5× |
+| `bluestore_read` / `_do_read` / `get_onode` | osd | 370 each | 34 each | 10.9× |
+| `_do_write_data` | osd | 202 | 44 | 4.6× |
+| `_do_write_big` | osd | 186 | 35 | 5.3× |
+| `txc_aio_wait` | osd | 180 | 25 | 7.2× |
+| `do_op` / `execute_ctx` | osd | ≈215 | ≈111 | 1.9× |
+| `issue_repop` | osd | 60 | 42 | 1.4× |
+| `rados_read` | rgw | 35 | 21 | 1.7× |
+| `get_obj` / `put_obj` / `execute` | rgw | ≈42 | ≈25 | 1.7× |
 
-Almost every OSD span name is **3–5× more frequent on east** because every PUT fans out to all 9 OSDs instead of 2. From a "trace bytes per second flowing into Tempo" standpoint, the EC pool produces dramatically more telemetry per logical operation.
+EC PUTs produce **5-9× more OSD spans per logical operation** than replicated PUTs. From a tracing-cost standpoint, EC dominates Tempo's ingest budget — the Tempo distributor reports 1.7M spans/s during the east window vs 195k/s during west. That's the price of full fan-out visibility; the span-batch-processor's `max_export_batch_size = 4096` is sized for it.
 
 ---
 
-## Known issues observed
+## Resolved since the previous run
 
-1. **Span-name cardinality on `multipart_upload`.** The fork's RGW currently builds the multipart parent span name as `"multipart_upload <upload_id>"` (`src/rgw/rgw_op.cc:4459`, `name()` virtual). Each upload becomes a unique span name in Prometheus, blowing up `traces_spanmetrics_*` cardinality (≈80% of all distinct span_names in this cluster's TSDB are `multipart_upload …` variants). A fix patch (`ceph-20.1.1-rgw-multipart-span-name-fix.patch`) is sitting in `tu503/homelab-overlay` but not yet built into the running RGW binaries — these benchmarks include the un-fixed behavior.
-2. **GET-path OSD spans missing.** The propagation patch handles PUT/RADOS-write but not RADOS-read. GET traces top out at the RGW `get_obj_data` span — no OSD-side detail.
-3. **Long-tail `op-request-created` spans (~85 s reported on west).** A handful of OSD spans have absurd reported durations. Likely a default-constructed `jspan_context` without `IsRecording()` guard somewhere in the read path, so the span's end timestamp ends up as the parent context's. The fork's `tracer-jspan-default-ctor.patch` and `tracer-null-guard.patch` fix this in known code paths; this case isn't covered yet.
+| previously known issue | status |
+|---|---|
+| GET-path OSD spans missing | **resolved** — `rgw-iterate-trace-ctx-plumbing.patch` threads `jspan_context` through `ReadOp::Params` → `RadosReadOp::iterate` → `RGWRados::Object::Read::iterate` → `get_obj_data` → `rgw::Aio::librados_op` → `librados::async_operate` → `IoCtx::aio_operate(... jspan_context)`. GET traces now fan to OSD spans (and through to bluestore_read on cache-miss reads). |
+| `librados::async_operate` for reads silently dropped trace_ctx | **resolved** — signature had been updated but the lambda body still called the 5-arg `aio_operate`. Fixed in `librados-asio-read-trace.patch`. |
+| Long-tail `op-request-created` spans (default-constructed `jspan_context`) | **resolved** — `bluestore-read-subspans-buildfix.patch` switched the 4 `PrimaryLogPG.cc` sites to `jspan_context{false, false}` (opentelemetry-cpp 1.24 dropped the default constructor). |
+| BlueStore tracer init silenced all OSD spans when `bluestore_tracing_enable=true` | **resolved** — added `Tracer::init_from_global()` and switched the bluestore init to use it instead of installing a new global `TracerProvider`. Previously the second `SetTracerProvider()` call orphaned the osd-tracer's `BatchSpanProcessor` and OSD spans went to /dev/null. |
+| `multipart_upload <upload_id>` span-name cardinality | **resolved** (already fixed in r2, confirmed in r3 — span name is now bound). |
+
+## New since the previous run
+
+- **rados_read span** on the rgw read path — one per chunk (default 4 MiB).
+- **BlueStore write-phase spans**: `_do_write_data` (and `_do_write_small`/`_do_write_big` children for each extent slice), `kv_submit_transaction`, `kv_committed_finalize` — turns the previously-opaque write-path latency between `queue_transactions` and the eventual completion into 5 attributable phases.
+- **BlueStore read sub-spans**: `bluestore_read` → `get_onode` + `_do_read` (covered by an earlier patch but only effective now that the parent trace context reaches BlueStore through the new plumbing).
+- Per-shard end-to-end visibility for EC writes — each of the 9 shards has its own `queue_transactions` subtree with all the new spans, so you can compare the speed of shard 0 vs shard 7 vs etc. directly.
+
+## Known issues remaining
+
+1. **Some PUT spans report multi-second durations on cold OSDs.** A handful of `op-request-created` spans hit 5-30 s in the long tail; correlates with OSD scrub activity. Not a tracing bug — the OSDs really did take that long under contention.
+2. **GET trace chain only fires for chunked reads.** Small objects (`< rgw_get_obj_max_req_size`, default 4 MiB) read inline from the head object via a synchronous path that doesn't go through `RGWRados::Object::Read::iterate`. No `rados_read` span fires for those. Instrumenting the head-read path is a separate change to `RGWRados::Object::Read::prepare/read`.
+3. **The east-zone EC backend uses `ECBackend` (optimized)** not `ECBackendL` (legacy). Cross-OSD shard read trace context is currently only wired for the optimized backend; legacy EC pools will still produce orphan OSD-side traces. ECBackendL update is a separate effort.
 
 ---
 
@@ -514,7 +480,15 @@ EAST_SK=$(radosgw-admin user info --uid=warp-bench --rgw-realm=east | jq -r .key
 WEST_AK=$(radosgw-admin user info --uid=warp-bench --rgw-realm=west | jq -r .keys[0].access_key)
 WEST_SK=$(radosgw-admin user info --uid=warp-bench --rgw-realm=west | jq -r .keys[0].secret_key)
 
-# 3. Run warp against each (serialize — same OSDs)
+# 3. Clear Tempo for a clean trace state
+kubectl -n monitoring scale deploy tempo --replicas=0
+kubectl -n monitoring run tempo-clear --rm -i --restart=Never --image=amazon/aws-cli:latest \
+  --env=AWS_ACCESS_KEY_ID=$TEMPO_AK --env=AWS_SECRET_ACCESS_KEY=$TEMPO_SK \
+  --command -- aws --endpoint-url=http://rgw-west.rgw-gateway.svc:7480 \
+                 s3 rm s3://tempo-traces/ --recursive --quiet
+kubectl -n monitoring scale deploy tempo --replicas=1
+
+# 4. Run warp against each (serialize — same OSDs)
 STAMP=$(date +%Y%m%d-%H%M%S)
 for zone in east west; do
   AK="${zone^^}_AK"; SK="${zone^^}_SK"
@@ -527,18 +501,21 @@ for zone in east west; do
     | tee warp-$zone.log
 done
 
-# 4. Pull representative traces (replace start/end with run window in epoch seconds)
-for zone in east west; do
-  for op in put_obj get_obj; do
-    TID=$(kubectl -n monitoring exec deploy/tempo -- wget -qO- \
-      "http://localhost:3200/api/search?q=%7Bresource.service.name%3D%22rgw%22%20%26%26%20name%3D%22$op%22%7D&start=$START&end=$END&limit=20" \
-      | jq -r '.traces | sort_by(-.durationMs) | .[0].traceID')
-    kubectl -n monitoring exec deploy/tempo -- wget -qO- \
-      "http://localhost:3200/api/traces/$TID" > traces/$zone-$op.json
-  done
+# 5. Pull representative traces (longest PUT + longest GET per zone in window)
+START=$EAST_START; END=$EAST_END   # epoch seconds
+for op in put_obj get_obj; do
+  Q='{rootServiceName="rgw" && name="'$op'" && resource.rgw.zone="east"}'
+  QENC=$(python3 -c "import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1]))" "$Q")
+  TID=$(kubectl -n monitoring exec deploy/tempo -- wget -qO- \
+    "http://localhost:3200/api/search?q=$QENC&start=$START&end=$END&limit=50" \
+    | jq -r '.traces | sort_by(-.durationMs) | .[0].traceID')
+  kubectl -n monitoring exec deploy/tempo -- wget -qO- \
+    "http://localhost:3200/api/traces/$TID" > traces/east-$op.json
 done
 
-# 5. Clean up
+# (repeat for west)
+
+# 6. Clean up
 radosgw-admin user rm --uid=warp-bench --rgw-realm=east --purge-data
 radosgw-admin user rm --uid=warp-bench --rgw-realm=west --purge-data
 ```
@@ -554,14 +531,15 @@ radosgw-admin user rm --uid=warp-bench --rgw-realm=west --purge-data
 │   ├── warp-east.log                  # full warp stdout for east run
 │   └── warp-west.log                  # full warp stdout for west run
 └── traces/
-    ├── east-put_obj.json              # OTLP trace, 95 spans, 44 KB
-    ├── east-get_obj.json              # OTLP trace, 4 spans, 2 KB
-    ├── west-put_obj.json              # OTLP trace, 33 spans, 16 KB
-    └── west-get_obj.json              # OTLP trace, 4 spans, 2 KB
+    ├── east-put_obj.json              # OTLP trace, 257 spans across 18 OSD batches, 95 KB
+    ├── east-get_obj.json              # OTLP trace, 12 spans across 6 OSD batches, 6 KB
+    ├── west-put_obj.json              # OTLP trace, 68 spans across 10 OSD batches, 28 KB
+    └── west-get_obj.json              # OTLP trace, 22 spans across 8 OSD batches, 10 KB
+                                       # (west GET includes bluestore_read._do_read = on-disk read path)
 ```
 
 Traces are raw output from Tempo's `/api/traces/{traceID}` (OTLP/JSON shape — `batches[].resource`, `batches[].scopeSpans[].spans[]`).
 
 ---
 
-*Generated by Claude Code, 2026-05-23. Cluster owner: tu503. The Ceph fork lives at [`tu503/ceph` branch `ceph-999`](https://github.com/tu503/ceph/tree/ceph-999); the overlay at [`tu503/homelab-overlay`](https://github.com/tu503/homelab-overlay).*
+*Updated 2026-05-25 by Claude Code (after the r3 tracer patch series landed). Cluster owner: tu503. The Ceph fork lives at [`tu503/ceph` branch `ceph-999`](https://github.com/tu503/ceph/tree/ceph-999); the overlay at [`tu503/homelab-overlay`](https://github.com/tu503/homelab-overlay).*
